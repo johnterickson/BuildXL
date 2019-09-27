@@ -11,6 +11,7 @@ using BuildXL.Utilities.Tasks;
 using Microsoft.VisualStudio.Services.BlobStore.Common;
 using Microsoft.VisualStudio.Services.BlobStore.WebApi;
 using Microsoft.VisualStudio.Services.Content.Common;
+using Microsoft.VisualStudio.Services.Content.Common.Tracing;
 using Microsoft.VisualStudio.Services.Drop.App.Core;
 using Microsoft.VisualStudio.Services.Drop.WebApi;
 using Microsoft.VisualStudio.Services.ItemStore.Common;
@@ -20,10 +21,10 @@ namespace Tool.ServicePipDaemon
     /// <summary>
     /// <see cref="IDropServiceClient"/> which will retry every operation in case <see cref="Microsoft.VisualStudio.Services.Common.VssUnauthorizedException"/> is caught.
     /// </summary>
-    public sealed class ReloadingDropServiceClient : IDropServiceClient
+    public sealed class ReloadingDropServiceClient : IDropServiceClient, IDedupStoreClient
     {
         private readonly ILogger m_logger;
-        private readonly Reloader<IDropServiceClient> m_reloader;
+        private readonly Reloader<(IDedupStoreClient, IDropServiceClient)> m_reloader;
         private readonly IEnumerable<TimeSpan> m_retryIntervals;
         private static readonly TimeSpan s_defaultOperationTimeout = TimeSpan.FromMinutes(5);
 
@@ -49,7 +50,7 @@ namespace Tool.ServicePipDaemon
         };
 
         /// <summary>Used for testing.</summary>
-        internal Reloader<IDropServiceClient> Reloader => m_reloader;
+        internal Reloader<(IDedupStoreClient,IDropServiceClient)> Reloader => m_reloader;
 
         /// <summary>
         /// Constructor.
@@ -57,17 +58,17 @@ namespace Tool.ServicePipDaemon
         /// <param name="logger">Logger.</param>
         /// <param name="clientConstructor">Target drop service client.</param>
         /// <param name="retryIntervals">How many times to retry and how much to wait between retries.</param>
-        public ReloadingDropServiceClient(ILogger logger, Func<IDropServiceClient> clientConstructor, IEnumerable<TimeSpan> retryIntervals = null)
+        public ReloadingDropServiceClient(ILogger logger, Func<(IDedupStoreClient,IDropServiceClient)> clientConstructor, IEnumerable<TimeSpan> retryIntervals = null)
         {
             m_logger = logger;
-            m_reloader = new Reloader<IDropServiceClient>(clientConstructor, destructor: client => client.Dispose());
+            m_reloader = new Reloader<(IDedupStoreClient, IDropServiceClient)>(clientConstructor, destructor: client => client.Item2.Dispose());
             m_retryIntervals = retryIntervals ?? s_defaultRetryIntervals;
         }
 
         #region Retry Logic
         private async Task<T> RetryAsync<T>(
             string operationName,
-            Func<IDropServiceClient, CancellationToken, Task<T>> fn,
+            Func<(IDedupStoreClient, IDropServiceClient), CancellationToken, Task<T>> fn,
             CancellationToken cancellationToken,
             IEnumerator<TimeSpan> retryIntervalEnumerator = null,
             bool reloadFirst = false,
@@ -116,7 +117,7 @@ namespace Tool.ServicePipDaemon
             }
         }
 
-        private Task RetryAsync(string operationName, Func<IDropServiceClient, CancellationToken, Task> fn, CancellationToken token)
+        private Task RetryAsync(string operationName, Func<(IDedupStoreClient, IDropServiceClient), CancellationToken, Task> fn, CancellationToken token)
         {
             return RetryAsync(
                 operationName,
@@ -144,7 +145,7 @@ namespace Tool.ServicePipDaemon
 
         #endregion
 
-        private Reloader<IDropServiceClient>.VersionedValue GetCurrentVersionedValue()
+        private Reloader<(IDedupStoreClient,IDropServiceClient)>.VersionedValue GetCurrentVersionedValue()
         {
             m_reloader.EnsureLoaded();
             return m_reloader.CurrentVersionedValue;
@@ -157,7 +158,7 @@ namespace Tool.ServicePipDaemon
         {
             return RetryAsync(
                 nameof(IDropServiceClient.RepairManifestAsync),
-                (client, ct) => client.RepairManifestAsync(dropName, ct),
+                (client, ct) => client.Item2.RepairManifestAsync(dropName, ct),
                 cancellationToken);
         }
 
@@ -166,7 +167,7 @@ namespace Tool.ServicePipDaemon
         {
             return RetryAsync(
                 nameof(IDropServiceClient.AssociateAsync),
-                (client, ct) => client.AssociateAsync(dropName, preComputedBlobIds, abortIfAlreadyExists, ct),
+                (client, ct) => client.Item2.AssociateAsync(dropName, preComputedBlobIds, abortIfAlreadyExists, ct),
                 cancellationToken);
         }
 
@@ -175,7 +176,7 @@ namespace Tool.ServicePipDaemon
         {
             return RetryAsync(
                 nameof(IDropServiceClient.CreateAsync),
-                (client, ct) => client.CreateAsync(dropName, isAppendOnly, expirationDate, chunkDedup, ct),
+                (client, ct) => client.Item2.CreateAsync(dropName, isAppendOnly, expirationDate, chunkDedup, ct),
                 cancellationToken);
         }
 
@@ -184,7 +185,7 @@ namespace Tool.ServicePipDaemon
         {
             return RetryAsync(
                 nameof(IDropServiceClient.DeleteAsync),
-                (client, ct) => client.DeleteAsync(dropItem, synchronous, ct),
+                (client, ct) => client.Item2.DeleteAsync(dropItem, synchronous, ct),
                 cancellationToken);
         }
 
@@ -193,7 +194,7 @@ namespace Tool.ServicePipDaemon
         {
             return RetryAsync(
                 nameof(IDropServiceClient.DownloadAsync),
-                (client, ct) => client.DownloadAsync(dropName, downloadContext, ct, releaseLocalCache),
+                (client, ct) => client.Item2.DownloadAsync(dropName, downloadContext, ct, releaseLocalCache),
                 cancellationToken);
         }
 
@@ -202,7 +203,7 @@ namespace Tool.ServicePipDaemon
         {
             return RetryAsync(
                 nameof(IDropServiceClient.DownloadFilesAsync),
-                (client, ct) => client.DownloadFilesAsync(mappings, ct),
+                (client, ct) => client.Item2.DownloadFilesAsync(mappings, ct),
                 cancellationToken);
         }
 
@@ -211,7 +212,7 @@ namespace Tool.ServicePipDaemon
         {
             return RetryAsync(
                 nameof(IDropServiceClient.FinalizeAsync),
-                (client, ct) => client.FinalizeAsync(dropName, ct),
+                (client, ct) => client.Item2.FinalizeAsync(dropName, ct),
                 cancellationToken);
         }
 
@@ -220,7 +221,7 @@ namespace Tool.ServicePipDaemon
         {
             return RetryAsync(
                 nameof(IDropServiceClient.GetDropAsync),
-                (client, ct) => client.GetDropAsync(dropName, ct),
+                (client, ct) => client.Item2.GetDropAsync(dropName, ct),
                 cancellationToken);
         }
 
@@ -229,7 +230,7 @@ namespace Tool.ServicePipDaemon
         {
             return RetryAsync(
                 nameof(IDropServiceClient.GetDropUri),
-                (client, ct) => client.GetDropUri(dropName, ct),
+                (client, ct) => client.Item2.GetDropUri(dropName, ct),
                 cancellationToken);
         }
 
@@ -238,7 +239,7 @@ namespace Tool.ServicePipDaemon
         {
             return RetryAsync(
                 nameof(IDropServiceClient.ListAsync),
-                (client, ct) => client.ListAsync(dropNamePrefix, pathOptions, includeNonFinalizedDrops, ct, retrievalOptions),
+                (client, ct) => client.Item2.ListAsync(dropNamePrefix, pathOptions, includeNonFinalizedDrops, ct, retrievalOptions),
                 cancellationToken);
         }
 
@@ -247,7 +248,7 @@ namespace Tool.ServicePipDaemon
         {
             return RetryAsync(
                 nameof(IDropServiceClient.UploadAndAssociateAsync),
-                (client, ct) => client.UploadAndAssociateAsync(dropName, preComputedBlobIds, abortIfAlreadyExists, firstAssociationStatus, ct),
+                (client, ct) => client.Item2.UploadAndAssociateAsync(dropName, preComputedBlobIds, abortIfAlreadyExists, firstAssociationStatus, ct),
                 cancellationToken);
         }
 
@@ -269,7 +270,7 @@ namespace Tool.ServicePipDaemon
         {
             return RetryAsync(
                 nameof(IDropServiceClient.ListFilePagesAsync),
-                (client, ct) => client.ListFilePagesAsync(dropName, tryToRetrieveFromLocalCache, ct, allowPartial, directories, recursive, getDownloadUris),
+                (client, ct) => client.Item2.ListFilePagesAsync(dropName, tryToRetrieveFromLocalCache, ct, allowPartial, directories, recursive, getDownloadUris),
                 cancellationToken);
         }
 
@@ -286,7 +287,7 @@ namespace Tool.ServicePipDaemon
         {
             return RetryAsync(
                  nameof(IDropServiceClient.PublishAsync),
-                 (client, ct) => client.PublishAsync(dropName, sourceDirectory, abortIfAlreadyExists, preComputedBlobIds, hashCompleteCallback, includeEmptyDirectories, lowercasePaths, ct),
+                 (client, ct) => client.Item2.PublishAsync(dropName, sourceDirectory, abortIfAlreadyExists, preComputedBlobIds, hashCompleteCallback, includeEmptyDirectories, lowercasePaths, ct),
                  cancellationToken);
         }
 
@@ -295,14 +296,72 @@ namespace Tool.ServicePipDaemon
         {
             return RetryAsync(
                     nameof(IDropServiceClient.UpdateExpirationAsync),
-                    (client, ct) => client.UpdateExpirationAsync(dropName, expirationTime, ct),
+                    (client, ct) => client.Item2.UpdateExpirationAsync(dropName, expirationTime, ct),
                     cancellationToken);
         }
 
         /// <inheritdoc />
         public string GetVersionString()
         {
-            return GetCurrentVersionedValue().Value.GetVersionString();
+            return GetCurrentVersionedValue().Value.Item2.GetVersionString();
+        }
+
+        public string ParseDownloadStatistics(long totalContentBytes, long physicalContentBytesDownloaded, long compressionDownloadBytesSaved, long dedupDownloadBytesSaved, long chunksDownloaded)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task<IDisposable> AcquireParallelismTokenAsync()
+        {
+            throw new NotImplementedException();
+        }
+
+        public IDedupUploadSession CreateUploadSession(IDedupStoreClient NOT_USED, KeepUntilBlobReference keepUntilReference, IAppTraceSource tracer, IFileSystem fileSystem)
+        {
+            return RetryAsync<IDedupUploadSession>(
+                nameof(IDedupStoreClient.CreateUploadSession),
+                (client, ct) => Task.FromResult(client.Item1.CreateUploadSession(client.Item1, keepUntilReference, tracer, fileSystem)),
+                CancellationToken.None).Result;
+        }
+
+        public Task DownloadToFileAsync(DedupIdentifier dedupId, string fullPath, GetDedupAsyncFunc dedupFetcher, Uri proxyUri, EdgeCache edgeCache, CancellationToken cancellationToken)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task<BuildXL.Cache.ContentStore.Hashing.DedupNode> DownloadToFileAsync(BuildXL.Cache.ContentStore.Hashing.DedupNode node, string fullPath, Uri proxyUri, EdgeCache edgeCache, CancellationToken cancellationToken)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task<MaybeCached<DedupCompressedBuffer>> GetChunkAsync(ChunkDedupIdentifier chunkId, CancellationToken cancellationToken)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task<MaybeCached<DedupCompressedBuffer>> GetDedupAsync(DedupIdentifier dedupId, CancellationToken cancellationToken)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task<BuildXL.Cache.ContentStore.Hashing.DedupNode> GetFilledNodesAsync(BuildXL.Cache.ContentStore.Hashing.DedupNode node, Uri proxyUri, EdgeCache edgeCache, CancellationToken cancellationToken)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task<MaybeCached<DedupCompressedBuffer>> GetNodeAsync(NodeDedupIdentifier nodeId, CancellationToken cancellationToken)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task<Dictionary<DedupIdentifier, GetDedupAsyncFunc>> GetDedupGettersAsync(ISet<DedupIdentifier> dedupIds, Uri proxyUri, EdgeCache edgeCache, CancellationToken cancellationToken)
+        {
+            throw new NotImplementedException();
+        }
+
+        public void ResetDownloadStatistics()
+        {
+            throw new NotImplementedException();
         }
 
         /// <inheritdoc />
@@ -310,12 +369,12 @@ namespace Tool.ServicePipDaemon
         {
             get
             {
-                return GetCurrentVersionedValue().Value.AttemptNumber;
+                return GetCurrentVersionedValue().Value.Item2.AttemptNumber;
             }
 
             set
             {
-                GetCurrentVersionedValue().Value.AttemptNumber = value;
+                GetCurrentVersionedValue().Value.Item2.AttemptNumber = value;
             }
         }
 
@@ -324,14 +383,20 @@ namespace Tool.ServicePipDaemon
         {
             get
             {
-                return GetCurrentVersionedValue().Value.DisposeTelemetry;
+                return GetCurrentVersionedValue().Value.Item2.DisposeTelemetry;
             }
 
             set
             {
-                GetCurrentVersionedValue().Value.DisposeTelemetry = value;
+                GetCurrentVersionedValue().Value.Item2.DisposeTelemetry = value;
             }
         }
+
+        public IDedupStoreHttpClient Client => throw new NotImplementedException();
+
+        public string DownloadStatistics => throw new NotImplementedException();
+
+        public DownloadStatisticsSummary DownloadStatisticsSummary => throw new NotImplementedException();
 
         #endregion
     }

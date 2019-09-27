@@ -27,6 +27,7 @@ using Microsoft.VisualStudio.Services.ItemStore.Common;
 using Newtonsoft.Json;
 using static BuildXL.Utilities.FormattableStringEx;
 using Tool.ServicePipDaemon;
+using Microsoft.VisualStudio.Services.BlobStore.WebApi;
 
 namespace Tool.DropDaemon
 {
@@ -86,13 +87,15 @@ namespace Tool.DropDaemon
 
         private readonly ILogger m_logger;
         private readonly DropConfig m_config;
-        private readonly IDropServiceClient m_dropClient;
+        private readonly ReloadingDropServiceClient m_dropClient;
         private readonly CancellationTokenSource m_cancellationSource;
         private readonly Timer m_batchTimer;
 
         private readonly BatchBlock<AddFileItem> m_batchBlock;
         private readonly BufferBlock<AddFileItem[]> m_bufferBlock;
         private readonly ActionBlock<AddFileItem[]> m_actionBlock;
+
+        private IDedupUploadSession m_uploadSession = null;
 
         private long m_lastTimeProcessAddFileRanInTicks = DateTime.UtcNow.Ticks;
 
@@ -173,6 +176,11 @@ namespace Tool.DropDaemon
                 chunkDedup: m_config.EnableChunkDedup,
                 cancellationToken: token);
 
+            if (m_config.EnableChunkDedup)
+            {
+                m_uploadSession = m_dropClient.CreateUploadSession(null, new KeepUntilBlobReference(DateTime.UtcNow.AddDays(7)), Tracer, FileSystem.Instance);
+            }
+
             Interlocked.Add(ref Stats.CreateTimeMs, ElapsedMillis(startTime));
             return result;
         }
@@ -246,7 +254,7 @@ namespace Tool.DropDaemon
         }
 
         [SuppressMessage("Microsoft.Reliability", "CA2000:Dispose client", Justification = "Caller is responsible for disposing it")]
-        private IDropServiceClient CreateDropServiceClient()
+        private (IDedupStoreClient, IDropServiceClient) CreateDropServiceClient()
         {
             var startTime = DateTime.UtcNow;
             var client = new DropServiceClient(
@@ -255,8 +263,11 @@ namespace Tool.DropDaemon
                 CacheContext,
                 new DropClientTelemetry(ServiceEndpoint, Tracer, enable: m_config.EnableTelemetry),
                 Tracer);
+            var dedupHttpClient = new DedupStoreHttpClient(ServiceEndpoint, GetCredentials());
+            var dedupStoreClient = new DedupStoreClient(dedupHttpClient, maxParallelism: 8 * Environment.ProcessorCount);
+
             Interlocked.Add(ref Stats.AuthTimeMs, ElapsedMillis(startTime));
-            return client;
+            return (dedupStoreClient,client);
         }
 
         /// <summary>
@@ -307,19 +318,35 @@ namespace Tool.DropDaemon
                 FileBlobDescriptor[] blobsForAssociate = await Task.WhenAll(batch.Select(item => item.FileBlobDescriptorForAssociateAsync(m_config.EnableChunkDedup, Token)));
                 Interlocked.Add(ref Stats.TotalComputeFileBlobDescriptorForAssociateMs, ElapsedMillis(startTime));
 
-                // run 'Associate' on all items from the batch; the result will indicate which files were associated and which need to be uploaded
-                AssociationsStatus associateStatus = await AssociateAsync(blobsForAssociate);
-                IReadOnlyList<AddFileItem> itemsLeftToUpload = await SetResultForAssociatedNonMissingItemsAsync(batch, associateStatus, m_config.EnableChunkDedup, Token);
+                if (m_config.EnableChunkDedup)
+                {
+                    var fileLookup = new Dictionary<BlobIdentifier, AddFileItem>();
 
-                // compute blobs for upload
-                startTime = DateTime.UtcNow;
-                FileBlobDescriptor[] blobsForUpload = await Task.WhenAll(itemsLeftToUpload.Select(item => item.FileBlobDescriptorForUploadAsync(m_config.EnableChunkDedup, Token)));
-                Interlocked.Add(ref Stats.TotalComputeFileBlobDescriptorForUploadMs, ElapsedMillis(startTime));
+                    foreach (var item in batch)
+                    {
+                        var itemFileBlobDescriptor = await item.FileBlobDescriptorForAssociateAsync(chunkDedup: true, CancellationToken.None);
+                        fileLookup[itemFileBlobDescriptor.BlobIdentifier] = item;
+                    }
 
-                // run 'UploadAndAssociate' for the missing files.
-                await UploadAndAssociateAsync(associateStatus, blobsForUpload);
-                SetResultForUploadedMissingItems(itemsLeftToUpload);
-                Interlocked.Add(ref Stats.TotalUploadSizeMb, blobsForUpload.Sum(b => b.FileSize ?? 0) >> 20);
+                    //await m_uploadSession.UploadAsync()
+                    
+                }
+                else
+                {
+                    // run 'Associate' on all items from the batch; the result will indicate which files were associated and which need to be uploaded
+                    AssociationsStatus associateStatus = await AssociateAsync(blobsForAssociate);
+                    IReadOnlyList<AddFileItem> itemsLeftToUpload = await SetResultForAssociatedNonMissingItemsAsync(batch, associateStatus, m_config.EnableChunkDedup, Token);
+
+                    // compute blobs for upload
+                    startTime = DateTime.UtcNow;
+                    FileBlobDescriptor[] blobsForUpload = await Task.WhenAll(itemsLeftToUpload.Select(item => item.FileBlobDescriptorForUploadAsync(m_config.EnableChunkDedup, Token)));
+                    Interlocked.Add(ref Stats.TotalComputeFileBlobDescriptorForUploadMs, ElapsedMillis(startTime));
+
+                    // run 'UploadAndAssociate' for the missing files.
+                    await UploadAndAssociateAsync(associateStatus, blobsForUpload);
+                    SetResultForUploadedMissingItems(itemsLeftToUpload);
+                    Interlocked.Add(ref Stats.TotalUploadSizeMb, blobsForUpload.Sum(b => b.FileSize ?? 0) >> 20);
+                }
 
                 m_logger.Info("Done processing AddFile batch.");
             }
